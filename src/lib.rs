@@ -1,7 +1,24 @@
 use anyhow::Result;
-use std::os::raw::c_char;
 use std::ffi::CStr;
 use std::fs;
+use std::os::raw::c_char;
+use std::process::Command;
+
+/// Converts a string literal into a C-compatible string pointer (`*const c_char`).
+///
+/// # Examples
+/// ```
+/// use std::os::raw::c_char;
+///
+/// let name = literal_as_c_char!("Test Plugin");
+/// // name is now a *const c_char pointing to "Test Plugin"
+/// ```
+macro_rules! literal_as_c_char {
+    ($s:expr) => {
+        concat!($s, "\0").as_ptr() as *const c_char
+    };
+}
+
 
 #[repr(C)]
 pub struct PluginInfo {
@@ -12,24 +29,25 @@ pub struct PluginInfo {
     pub default_prefix: *const c_char,
 }
 
+#[allow(dead_code)]
 #[derive(Clone)]
 struct AppInfo {
     name: String,
-    exec: String,
+    description: String,
+    path: String,
     icon: Option<String>,
     emoji: Option<String>,
 }
 
 #[repr(C)]
 pub struct Entry {
-    pub name: *const c_char, // the display name
+    pub name: *const c_char,        // the display name
     pub description: *const c_char, // still not sure what ill use this for
-    pub value: *const c_char, // the value that is gonna be passed to `handle_selection`
-    pub icon: *const c_char, // icon path (can be null)
-    pub emoji: *const c_char, // emoji (can be null)
+    pub value: *const c_char,       // the value that is gonna be passed to `handle_selection`
+    pub icon: *const c_char,        // icon path (can be null)
+    pub emoji: *const c_char,       // emoji (can be null)
 }
 
-// SAFETY: Entry only contains raw pointers which are safe to share between threads
 unsafe impl Send for Entry {}
 unsafe impl Sync for Entry {}
 
@@ -39,43 +57,56 @@ pub struct EntryList {
     pub length: usize,
 }
 
-// SAFETY: PluginInfo only contains raw pointers which are safe to share between threads
 unsafe impl Send for PluginInfo {}
 unsafe impl Sync for PluginInfo {}
 
 #[unsafe(no_mangle)]
 pub static PLUGIN_INFO: PluginInfo = PluginInfo {
-    name: b"Test Plugin\0".as_ptr() as *const c_char,
-    version: b"1.0.0\0".as_ptr() as *const c_char,
-    description: b"yaal\0".as_ptr() as *const c_char,
-    author: b"Ri\0".as_ptr() as *const c_char,
-    default_prefix: b"\0".as_ptr() as *const c_char,
+    name: literal_as_c_char!("Test Plugin"),
+    version: literal_as_c_char!("1.0.0"),
+    description: literal_as_c_char!("yaal"),
+    author: literal_as_c_char!("Ri"),
+    default_prefix: literal_as_c_char!(""),
 };
 
 #[unsafe(no_mangle)]
 pub extern "C" fn handle_selection(selection: *const c_char) {
-    println!("yey");
     let sel = unsafe { CStr::from_ptr(selection) };
-    println!("{}", sel.to_string_lossy());
+
+    let status = Command::new("gio")
+        .args([
+            "launch",
+            sel.to_str().unwrap(),
+        ])
+        .status()
+        .expect("Failed to open .desktop file");
+
+    if !status.success() {
+        println!("app : {}", sel.to_string_lossy());
+        panic!("Error launching application");
+    }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn get_entries() -> EntryList {
     let apps = load_applications().unwrap();
     let mut entries = Vec::new();
-    
+
     for app in apps {
         let name = Box::leak(format!("{}\0", app.name).into_boxed_str());
-        let exec = Box::leak(format!("{}\0", app.exec).into_boxed_str());
-        let icon = app.icon.map(|i| Box::leak(format!("{}\0", i).into_boxed_str()));
-        let emoji = app.emoji.map(|e| Box::leak(format!("{}\0", e).into_boxed_str()));
+        let path = Box::leak(format!("{}\0", app.path).into_boxed_str());
+        let description = Box::leak(format!("{}\0", app.description).into_boxed_str());
+        let icon = app
+            .icon
+            .map(|i| Box::leak(format!("{}\0", i).into_boxed_str()));
+        let emoji = std::ptr::null();
 
         entries.push(Entry {
             name: name.as_ptr() as *const c_char,
-            description: name.as_ptr() as *const c_char,
-            value: exec.as_ptr() as *const c_char,
+            description: description.as_ptr() as *const c_char,
+            value: path.as_ptr() as *const c_char,
             icon: icon.map_or(std::ptr::null(), |s| s.as_ptr() as *const c_char),
-            emoji: emoji.map_or(std::ptr::null(), |s| s.as_ptr() as *const c_char),
+            emoji: emoji,
         });
     }
     let list = EntryList {
@@ -86,17 +117,17 @@ pub extern "C" fn get_entries() -> EntryList {
     list
 }
 
-fn parse_desktop_file(content: &str) -> Option<AppInfo> {
+fn parse_desktop_file(content: &str, path: &str) -> Option<AppInfo> {
     let mut name = None;
-    let mut exec = None;
     let mut icon = None;
-    let mut _emoji: Option<String> = None;
+    let mut description = None;
+    let mut _emoji: Option<String> = None; // i don't use emoji in this plugin
     let mut in_desktop_entry = false;
     let mut no_display = false;
 
     for line in content.lines() {
         let line = line.trim();
-        
+
         if line == "[Desktop Entry]" {
             in_desktop_entry = true;
             continue;
@@ -112,8 +143,8 @@ fn parse_desktop_file(content: &str) -> Option<AppInfo> {
         if let Some((key, value)) = line.split_once('=') {
             match key.trim() {
                 "Name" => name = Some(value.trim().to_string()),
-                "Exec" => exec = Some(value.trim().to_string()),
                 "Icon" => icon = Some(value.trim().to_string()),
+                "Comment" => description = Some(value.trim().to_string()),
                 "NoDisplay" => no_display = value.trim().eq_ignore_ascii_case("true"),
                 _ => {}
             }
@@ -124,10 +155,11 @@ fn parse_desktop_file(content: &str) -> Option<AppInfo> {
         return None;
     }
 
-    match (name, exec, icon) {
-        (Some(name), Some(exec), Some(icon)) => Some(AppInfo {
+    match (name, icon, description) {
+        (Some(name), Some(icon), Some(description)) => Some(AppInfo {
             name,
-            exec,
+            description,
+            path: path.to_string(),
             icon: Some(icon),
             emoji: None,
         }),
@@ -154,7 +186,7 @@ fn load_applications() -> Result<Vec<AppInfo>> {
 
             if let Ok(content) = fs::read_to_string(&path) {
                 println!("try to load app: {}", path.to_string_lossy());
-                if let Some(app_info) = parse_desktop_file(&content) {
+                if let Some(app_info) = parse_desktop_file(&content, &path.to_string_lossy()) {
                     apps.push(app_info);
                 }
             }
