@@ -3,6 +3,7 @@ use std::ffi::CStr;
 use std::fs;
 use std::os::raw::c_char;
 use std::process::Command;
+use std::collections::HashSet;
 
 /// Converts a string literal into a C-compatible string pointer (`*const c_char`).
 ///
@@ -18,6 +19,21 @@ macro_rules! literal_as_c_char {
         concat!($s, "\0").as_ptr() as *const c_char
     };
 }
+
+// TODO:
+// - search though all system, exluding: 
+//let mut exclude_dirs: Vec<PathBuf> = vec![
+//    "/proc",
+//    "/sys",
+//    "/dev",
+//    "/run",
+//    "/tmp",
+//    "/var/lib/docker",
+//]
+// .into_iter()
+// .map(PathBuf::from)
+// .collect();
+// - check for duplicates
 
 
 #[repr(C)]
@@ -70,7 +86,7 @@ pub static PLUGIN_INFO: PluginInfo = PluginInfo {
 };
 
 #[unsafe(no_mangle)]
-pub extern "C" fn handle_selection(selection: *const c_char) {
+pub extern "C" fn handle_selection(selection: *const c_char) -> bool {
     let sel = unsafe { CStr::from_ptr(selection) };
 
     let status = Command::new("gio")
@@ -83,15 +99,15 @@ pub extern "C" fn handle_selection(selection: *const c_char) {
 
     if !status.success() {
         println!("app : {}", sel.to_string_lossy());
-        panic!("Error launching application");
+        return false;
     }
+    true
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn get_entries() -> EntryList {
     let apps = load_applications().unwrap();
     let mut entries = Vec::new();
-
     for app in apps {
         let name = Box::leak(format!("{}\0", app.name).into_boxed_str());
         let path = Box::leak(format!("{}\0", app.path).into_boxed_str());
@@ -124,6 +140,7 @@ fn parse_desktop_file(content: &str, path: &str) -> Option<AppInfo> {
     let mut _emoji: Option<String> = None; // i don't use emoji in this plugin
     let mut in_desktop_entry = false;
     let mut no_display = false;
+    let mut hidden = false;
 
     for line in content.lines() {
         let line = line.trim();
@@ -146,12 +163,13 @@ fn parse_desktop_file(content: &str, path: &str) -> Option<AppInfo> {
                 "Icon" => icon = Some(value.trim().to_string()),
                 "Comment" => description = Some(value.trim().to_string()),
                 "NoDisplay" => no_display = value.trim().eq_ignore_ascii_case("true"),
+                "Hidden" => hidden = value.trim().eq_ignore_ascii_case("true"),
                 _ => {}
             }
         }
     }
 
-    if no_display {
+    if no_display || hidden {
         return None;
     }
 
@@ -170,6 +188,7 @@ fn parse_desktop_file(content: &str, path: &str) -> Option<AppInfo> {
 fn load_applications() -> Result<Vec<AppInfo>> {
     let xdg_dirs = xdg::BaseDirectories::new()?;
     let mut apps = Vec::new();
+    let mut seen_names = HashSet::new();
 
     for entry in xdg_dirs.get_data_dirs() {
         let apps_dir = entry.join("applications");
@@ -180,18 +199,34 @@ fn load_applications() -> Result<Vec<AppInfo>> {
         for entry in std::fs::read_dir(apps_dir)? {
             let entry = entry?;
             let path = entry.path();
+            
             if path.extension().and_then(|s| s.to_str()) != Some("desktop") {
                 continue;
             }
 
-            if let Ok(content) = fs::read_to_string(&path) {
-                println!("try to load app: {}", path.to_string_lossy());
-                if let Some(app_info) = parse_desktop_file(&content, &path.to_string_lossy()) {
+            if path.starts_with("/tmp") {
+                continue;
+            }
+
+            if !path.exists() || !path.is_file() {
+                println!("Skipping inaccessible file: {:?}", path);
+                continue;
+            }
+
+            let content = match fs::read_to_string(&path) {
+                Ok(content) => content,
+                Err(e) => {
+                    println!("Could not read file {:?}: {}", path, e);
+                    continue;
+                }
+            };
+            if let Some(app_info) = parse_desktop_file(&content, &path.to_string_lossy()) {
+                if seen_names.insert(app_info.name.clone()) {
                     apps.push(app_info);
                 }
             }
         }
     }
-
     Ok(apps)
 }
+
