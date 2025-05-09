@@ -2,6 +2,7 @@ use anyhow::Result;
 use std::ffi::CStr;
 use std::fs;
 use std::os::raw::c_char;
+use std::path::PathBuf;
 use std::process::Command;
 use std::collections::HashSet;
 
@@ -49,7 +50,7 @@ pub struct PluginInfo {
 #[derive(Clone)]
 struct AppInfo {
     name: String,
-    description: String,
+    description: Option<String>,
     path: String,
     icon: Option<String>,
     emoji: Option<String>,
@@ -58,7 +59,7 @@ struct AppInfo {
 #[repr(C)]
 pub struct Entry {
     pub name: *const c_char,        // the display name
-    pub description: *const c_char, // still not sure what ill use this for
+    pub description: *const c_char, // still not sure what ill use this for, optional
     pub value: *const c_char,       // the value that is gonna be passed to `handle_selection`
     pub icon: *const c_char,        // icon path (can be null)
     pub emoji: *const c_char,       // emoji (can be null)
@@ -98,7 +99,6 @@ pub extern "C" fn handle_selection(selection: *const c_char) -> bool {
         .expect("Failed to open .desktop file");
 
     if !status.success() {
-        println!("app : {}", sel.to_string_lossy());
         return false;
     }
     true
@@ -111,7 +111,9 @@ pub extern "C" fn get_entries() -> EntryList {
     for app in apps {
         let name = Box::leak(format!("{}\0", app.name).into_boxed_str());
         let path = Box::leak(format!("{}\0", app.path).into_boxed_str());
-        let description = Box::leak(format!("{}\0", app.description).into_boxed_str());
+        let description = app
+            .description
+            .map(|d| Box::leak(format!("{}\0", d).into_boxed_str()));
         let icon = app
             .icon
             .map(|i| Box::leak(format!("{}\0", i).into_boxed_str()));
@@ -119,7 +121,7 @@ pub extern "C" fn get_entries() -> EntryList {
 
         entries.push(Entry {
             name: name.as_ptr() as *const c_char,
-            description: description.as_ptr() as *const c_char,
+            description: description.map_or(std::ptr::null(), |s| s.as_ptr() as *const c_char),
             value: path.as_ptr() as *const c_char,
             icon: icon.map_or(std::ptr::null(), |s| s.as_ptr() as *const c_char),
             emoji: emoji,
@@ -173,8 +175,8 @@ fn parse_desktop_file(content: &str, path: &str) -> Option<AppInfo> {
         return None;
     }
 
-    match (name, icon, description) {
-        (Some(name), Some(icon), Some(description)) => Some(AppInfo {
+    match (name, icon) {
+        (Some(name), Some(icon)) => Some(AppInfo {
             name,
             description,
             path: path.to_string(),
@@ -186,12 +188,26 @@ fn parse_desktop_file(content: &str, path: &str) -> Option<AppInfo> {
 }
 
 fn load_applications() -> Result<Vec<AppInfo>> {
-    let xdg_dirs = xdg::BaseDirectories::new()?;
+    let xdg_dirs = xdg::BaseDirectories::new();
     let mut apps = Vec::new();
     let mut seen_names = HashSet::new();
+    let home_dir = home::home_dir();
+    let mut paths: Vec<PathBuf> = Vec::new();
+    if let Some(home_dir) = home_dir {
+        let local_apps = home_dir.join(".local/share/applications");
+        paths.push(local_apps);
+        let xdg_paths = xdg_dirs.get_data_dirs();
+        paths.extend(xdg_paths);
+    } else {
+        return Err(anyhow::anyhow!("Failed to get home directory"));
+    }
 
-    for entry in xdg_dirs.get_data_dirs() {
-        let apps_dir = entry.join("applications");
+    for path in paths {
+        let apps_dir = if path.ends_with("applications") {
+            path
+        } else {
+            path.join("applications")
+        };
         if !apps_dir.exists() {
             continue;
         }
@@ -209,14 +225,12 @@ fn load_applications() -> Result<Vec<AppInfo>> {
             }
 
             if !path.exists() || !path.is_file() {
-                println!("Skipping inaccessible file: {:?}", path);
                 continue;
             }
 
             let content = match fs::read_to_string(&path) {
                 Ok(content) => content,
                 Err(e) => {
-                    println!("Could not read file {:?}: {}", path, e);
                     continue;
                 }
             };

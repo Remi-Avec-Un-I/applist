@@ -6,8 +6,9 @@ build = "build.rs"
 
 [dependencies]
 libc = "0.2"
-xdg = "2.5.1"
+xdg = "3.0.0"
 anyhow = "1.0"
+home = "0.5"
 
 [lib]
 crate-type = ["cdylib"]  # This tells Rust to build a dynamic library
