@@ -21,22 +21,6 @@ macro_rules! literal_as_c_char {
     };
 }
 
-// TODO:
-// - search though all system, exluding: 
-//let mut exclude_dirs: Vec<PathBuf> = vec![
-//    "/proc",
-//    "/sys",
-//    "/dev",
-//    "/run",
-//    "/tmp",
-//    "/var/lib/docker",
-//]
-// .into_iter()
-// .map(PathBuf::from)
-// .collect();
-// - check for duplicates
-
-
 #[repr(C)]
 pub struct PluginInfo {
     pub name: *const c_char,
@@ -79,9 +63,9 @@ unsafe impl Sync for PluginInfo {}
 
 #[unsafe(no_mangle)]
 pub static PLUGIN_INFO: PluginInfo = PluginInfo {
-    name: literal_as_c_char!("Test Plugin"),
+    name: literal_as_c_char!("Application finder"),
     version: literal_as_c_char!("1.0.0"),
-    description: literal_as_c_char!("yaal"),
+    description: literal_as_c_char!("Find applications on your system"),
     author: literal_as_c_char!("Ri"),
     default_prefix: literal_as_c_char!(""),
 };
@@ -231,6 +215,7 @@ fn load_applications() -> Result<Vec<AppInfo>> {
             let content = match fs::read_to_string(&path) {
                 Ok(content) => content,
                 Err(e) => {
+                    println!("Failed to read desktop file: {}", e);
                     continue;
                 }
             };
