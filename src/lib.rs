@@ -73,24 +73,13 @@ pub static PLUGIN_INFO: PluginInfo = PluginInfo {
 #[unsafe(no_mangle)]
 pub extern "C" fn handle_selection(selection: *const c_char) -> bool {
     let sel = unsafe { CStr::from_ptr(selection) };
-
-    let status = Command::new("gio")
-        .args([
-            "launch",
-            sel.to_str().unwrap(),
-        ])
-        .status()
-        .expect("Failed to open .desktop file");
-
-    if !status.success() {
-        return false;
-    }
-    true
+    execute_gio_launch(sel.to_str().unwrap())
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn get_entries() -> EntryList {
-    let apps = load_applications().unwrap();
+pub extern "C" fn get_entries(query: *const c_char) -> EntryList {
+    let mut apps = load_applications().unwrap();
+    
     let mut entries = Vec::new();
     for app in apps {
         let name = Box::leak(format!("{}\0", app.name).into_boxed_str());
@@ -105,17 +94,36 @@ pub extern "C" fn get_entries() -> EntryList {
 
         entries.push(Entry {
             name: name.as_ptr() as *const c_char,
-            description: description.map_or(std::ptr::null(), |s| s.as_ptr() as *const c_char),
             value: path.as_ptr() as *const c_char,
+            description: description.map_or(std::ptr::null(), |s| s.as_ptr() as *const c_char),
             icon: icon.map_or(std::ptr::null(), |s| s.as_ptr() as *const c_char),
             emoji: emoji,
         });
     }
-    let list = EntryList {
-        entries: entries.as_ptr() as *const Entry,
-        length: entries.len(),
+
+    let mut filtered_entries = Vec::new();
+    let query_str = if query.is_null() || query as usize == 1 {
+        "".to_string()
+    } else {
+        unsafe { CStr::from_ptr(query).to_string_lossy().into_owned() }
     };
-    std::mem::forget(entries);
+    let query_str = query_str.to_lowercase();
+    println!("Query string received: {:?}", query_str);
+    
+    for entry in entries {
+        let name = unsafe { CStr::from_ptr(entry.name).to_string_lossy() };
+        let name_lower = name.to_lowercase();
+        if query_str.is_empty() || name_lower.contains(&query_str) {
+            println!("Adding entry: {:?} for query: {:?}", name, query_str);
+            filtered_entries.push(entry);
+        }
+    }
+    
+    let list = EntryList {
+        entries: filtered_entries.as_ptr() as *const Entry,
+        length: filtered_entries.len(),
+    };
+    std::mem::forget(filtered_entries);
     list
 }
 
@@ -229,3 +237,42 @@ fn load_applications() -> Result<Vec<AppInfo>> {
     Ok(apps)
 }
 
+#[cfg(not(test))]
+fn execute_gio_launch(path: &str) -> bool {
+    Command::new("gio")
+        .args(["launch", path])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+fn execute_gio_launch(_path: &str) -> bool {
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_load_applications() {
+        let apps = load_applications().unwrap();
+        assert!(!apps.is_empty());
+    }
+
+    #[test]
+    fn get_entries_test() {
+        let entries = get_entries(literal_as_c_char!(""));
+        assert!(!entries.entries.is_null());
+        assert!(entries.length > 0);
+    }
+
+    #[test]
+    fn handle_selection_test() {
+        let selection = literal_as_c_char!("firefox");
+        let result = handle_selection(selection);
+        assert!(result);
+    }
+    
+}
