@@ -38,6 +38,7 @@ struct AppInfo {
     path: String,
     icon: Option<String>,
     emoji: Option<String>,
+    terminal: bool,
 }
 
 #[repr(C)]
@@ -71,14 +72,40 @@ pub static PLUGIN_INFO: PluginInfo = PluginInfo {
 };
 
 #[unsafe(no_mangle)]
+pub extern "C" fn init_config(config: *const c_char) -> bool {
+    if config.is_null() {
+        println!("Config is null");
+        return false;
+    }
+    
+    let config_str = unsafe { CStr::from_ptr(config) };
+    let config_json = config_str.to_str().unwrap_or("");
+    println!("Applist Plugin received config: {}", config_json);
+    
+    // For now, just acknowledge the config
+    // You can add actual config parsing here later if needed
+    true
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn handle_selection(selection: *const c_char) -> bool {
     let sel = unsafe { CStr::from_ptr(selection) };
-    execute_gio_launch(sel.to_str().unwrap())
+    let path = sel.to_str().unwrap();
+    
+    // Load applications to check if this is a terminal app
+    if let Ok(apps) = load_applications() {
+        if let Some(app) = apps.iter().find(|app| app.path == path) {
+            return execute_gio_launch(path, app.terminal);
+        }
+    }
+    
+    // Fallback to default behavior
+    execute_gio_launch(path, false)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn get_entries(query: *const c_char) -> EntryList {
-    let mut apps = load_applications().unwrap();
+    let apps = load_applications().unwrap();
     
     let mut entries = Vec::new();
     for app in apps {
@@ -108,13 +135,11 @@ pub extern "C" fn get_entries(query: *const c_char) -> EntryList {
         unsafe { CStr::from_ptr(query).to_string_lossy().into_owned() }
     };
     let query_str = query_str.to_lowercase();
-    println!("Query string received: {:?}", query_str);
     
     for entry in entries {
         let name = unsafe { CStr::from_ptr(entry.name).to_string_lossy() };
         let name_lower = name.to_lowercase();
         if query_str.is_empty() || name_lower.contains(&query_str) {
-            println!("Adding entry: {:?} for query: {:?}", name, query_str);
             filtered_entries.push(entry);
         }
     }
@@ -135,6 +160,7 @@ fn parse_desktop_file(content: &str, path: &str) -> Option<AppInfo> {
     let mut in_desktop_entry = false;
     let mut no_display = false;
     let mut hidden = false;
+    let mut terminal = false; // Add terminal detection
 
     for line in content.lines() {
         let line = line.trim();
@@ -158,6 +184,7 @@ fn parse_desktop_file(content: &str, path: &str) -> Option<AppInfo> {
                 "Comment" => description = Some(value.trim().to_string()),
                 "NoDisplay" => no_display = value.trim().eq_ignore_ascii_case("true"),
                 "Hidden" => hidden = value.trim().eq_ignore_ascii_case("true"),
+                "Terminal" => terminal = value.trim().eq_ignore_ascii_case("true"), // Detect terminal apps
                 _ => {}
             }
         }
@@ -174,6 +201,7 @@ fn parse_desktop_file(content: &str, path: &str) -> Option<AppInfo> {
             path: path.to_string(),
             icon: Some(icon),
             emoji: None,
+            terminal, // Set the terminal flag
         }),
         _ => None,
     }
@@ -238,7 +266,61 @@ fn load_applications() -> Result<Vec<AppInfo>> {
 }
 
 #[cfg(not(test))]
-fn execute_gio_launch(path: &str) -> bool {
+fn execute_gio_launch(path: &str, terminal: bool) -> bool {
+    // First, validate the desktop file
+    let validate_result = Command::new("desktop-file-validate")
+        .arg(path)
+        .output();
+    
+    if let Ok(output) = validate_result {
+        if !output.status.success() {
+            println!("Desktop file validation failed: {}", String::from_utf8_lossy(&output.stderr));
+            return false;
+        }
+    }
+    
+    // For terminal applications, launch them directly in a terminal
+    if terminal {
+        // Try to find a terminal emulator
+        let terminals = ["gnome-terminal", "konsole", "xterm", "alacritty", "kitty", "urxvt", "st"];
+        
+        for terminal_cmd in &terminals {
+            // Extract the executable from the desktop file
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if let Some(exec_line) = content.lines().find(|line| line.starts_with("Exec=")) {
+                    let exec_cmd = exec_line.strip_prefix("Exec=").unwrap_or("");
+                    // Remove % parameters and clean up the command
+                    let clean_cmd = exec_cmd.split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .trim();
+                    
+                    if !clean_cmd.is_empty() {
+                        let result = Command::new(terminal_cmd)
+                            .args(["-e", clean_cmd])
+                            .spawn();
+                        
+                        if let Ok(_) = result {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // For non-terminal apps, try gtk-launch first
+    let gtk_result = Command::new("gtk-launch")
+        .arg(path)
+        .status();
+    
+    if let Ok(status) = gtk_result {
+        if status.success() {
+            return true;
+        }
+    }
+    
+    // Fallback to gio launch
     Command::new("gio")
         .args(["launch", path])
         .status()
@@ -247,7 +329,7 @@ fn execute_gio_launch(path: &str) -> bool {
 }
 
 #[cfg(test)]
-fn execute_gio_launch(_path: &str) -> bool {
+fn execute_gio_launch(_path: &str, _terminal: bool) -> bool {
     true
 }
 
